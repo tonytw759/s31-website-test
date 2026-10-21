@@ -1,64 +1,79 @@
-"""S31 site QA: static checks plus Playwright browser smoke checks.
-Run: pip install playwright beautifulsoup4; python -m playwright install chromium
-     python test_s31.py --html ../S31_完整網站_舊功能徹底移除_20261021.html
-     python test_s31.py --url https://ssss31.netlify.app/ --browser
-No orders, refunds or destructive actions are submitted by this script.
-"""
-import argparse, json, re, sys, datetime
+"""S31 browser QA. Login smoke test; no orders/payments/refunds are submitted."""
+import argparse, datetime, json, os, re, sys
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-BANNED_VISIBLE=[r'Google Apps Script 網址',r'清理預設或殘留測試資料',r'確認不再加單[・·]統整匯款金額',r'出貨滿\s*10\s*日自動']
-REQUIRED_IDS=['topNavBtnHome','topNavBtnLogin','topNavBtnOrders','admTab_orders','admTab_products','admTab_analytics','admOrdTab_pending','admOrdTab_bought','admOrdTab_packing','admOrdTab_shipped','admOrdTab_completed']
+BANNED=[r'Google Apps Script 網址',r'清理預設或殘留測試資料',r'確認不再加單[・·]統整匯款金額',r'出貨滿\s*10\s*日自動']
+IDS=['topNavBtnHome','topNavBtnLogin','topNavBtnOrders','admTab_orders','admTab_products','admTab_analytics','admOrdTab_pending','admOrdTab_bought','admOrdTab_packing','admOrdTab_shipped','admOrdTab_completed']
+
+def result(name, ok, detail=''):
+    return {'test':name,'status':'PASS' if ok else 'FAIL','detail':detail}
 
 def static(html):
     soup=BeautifulSoup(html,'html.parser')
     for s in soup(['script','style','template']):s.decompose()
     visible=soup.get_text(' ',strip=True)
-    results=[]
-    for pat in BANNED_VISIBLE:
-        m=re.search(pat,visible,re.I)
-        results.append(dict(test='舊文字不存在: '+pat, status='FAIL' if m else 'PASS', detail=m.group(0) if m else ''))
-    for id_ in REQUIRED_IDS:
-        results.append(dict(test='必要介面 ID: '+id_,status='PASS' if soup.find(id=id_) else 'FAIL'))
-    return results
+    return [result('舊文字不存在: '+p,not re.search(p,visible,re.I)) for p in BANNED]+[result('必要介面 ID: '+i,soup.find(id=i) is not None) for i in IDS]
 
-def browser(url, headed=False):
-    try:from playwright.sync_api import sync_playwright
-    except ImportError:
-        return [dict(test='Playwright 安裝',status='BLOCKED',detail='pip install playwright && python -m playwright install chromium')]
-    results=[]
+def run(url):
+    from playwright.sync_api import sync_playwright
+    out=[]
+    username=os.getenv('S31_TEST_USERNAME','')
+    password=os.getenv('S31_TEST_PASSWORD','')
     with sync_playwright() as p:
-        b=p.chromium.launch(headless=not headed)
-        page=b.new_page(viewport={'width':390,'height':844}, locale='zh-TW')
+        browser=p.chromium.launch(headless=True)
+        page=browser.new_page(viewport={'width':390,'height':844},locale='zh-TW')
+        page.on('dialog',lambda d:d.accept())
         errors=[]
         page.on('pageerror',lambda e:errors.append(str(e)))
         try:
-            r=page.goto(url,wait_until='domcontentloaded',timeout=30000)
-            results.append(dict(test='線上首頁 HTTP',status='PASS' if r and r.ok else 'FAIL',detail=str(r.status) if r else '無回應'))
+            response=page.goto(url,wait_until='domcontentloaded',timeout=45000)
+            out.append(result('首頁 HTTP 200',bool(response and response.ok),str(response.status) if response else '無回應'))
             page.wait_for_timeout(3500)
-            results.extend(static(page.content()))
-            results.append(dict(test='JavaScript 未捕獲錯誤',status='PASS' if not errors else 'FAIL',detail=' | '.join(errors[:5])))
-            for id_ in ['topNavBtnHome','topNavBtnLogin','topNavBtnOrders']:
-                loc=page.locator('#'+id_)
-                results.append(dict(test='手機版顯示 '+id_,status='PASS' if loc.count() and loc.first.is_visible() else 'FAIL'))
+            out+=static(page.content())
+            out.append(result('未登入首頁可見',page.locator('#topNavBtnHome').is_visible()))
+            out.append(result('未登入登入按鈕可見',page.locator('#topNavBtnLogin').is_visible()))
+            # Orders is intentionally hidden when logged out: do not require visibility.
+            out.append(result('未登入我的訂單按鈕存在（允許隱藏）',page.locator('#topNavBtnOrders').count()>0))
             page.screenshot(path='s31_mobile.png',full_page=True)
             page.set_viewport_size({'width':1365,'height':900})
             page.screenshot(path='s31_desktop.png',full_page=True)
-            results.append(dict(test='手機與桌面截圖',status='PASS',detail='s31_mobile.png / s31_desktop.png'))
-        except Exception as e:results.append(dict(test='瀏覽器連線/載入',status='BLOCKED',detail=str(e)[:500]))
-        finally:b.close()
-    return results
+            out.append(result('手機及桌面截圖',True))
+            if not username or not password:
+                out.append({'test':'登入驗證','status':'BLOCKED','detail':'未提供 S31_TEST_USERNAME / S31_TEST_PASSWORD Secrets'})
+            else:
+                page.set_viewport_size({'width':390,'height':844})
+                page.locator('#topNavBtnLogin').click(timeout=10000)
+                page.locator('#memberModal').wait_for(state='visible',timeout=10000)
+                page.evaluate("switchAuthModalTab('account')")
+                page.locator('#loginAccInput').fill(username)
+                page.locator('#loginPwdInput').fill(password)
+                page.locator('#btnSubmitAccLogin').click(timeout=10000)
+                # Supabase async authentication. Never log username/password, request payloads, or authenticated screenshots.
+                try:
+                    page.wait_for_function("typeof s31SupabaseUser !== 'undefined' && !!s31SupabaseUser && typeof memberToken !== 'undefined' && !!memberToken",timeout=20000)
+                    out.append(result('Supabase 帳密登入',True))
+                    out.append(result('登入後我的訂單可見',page.locator('#topNavBtnOrders').is_visible()))
+                    is_admin=page.evaluate("typeof s31IsAdmin !== 'undefined' && !!s31IsAdmin")
+                    out.append(result('管理員角色驗證',is_admin,'管理員' if is_admin else '未取得管理員角色'))
+                    out.append(result('登入後賣家控制列存在',page.locator('#sellerControlBar').count()>0))
+                except Exception:
+                    # Deliberately no screenshots / response body on auth failure.
+                    out.append(result('Supabase 帳密登入',False,'20 秒內未取得登入狀態；請檢查帳密、Supabase Auth 或網站登入錯誤'))
+            out.append(result('JavaScript 未捕獲錯誤',not errors,' | '.join(errors[:3])[:400] if errors else ''))
+        except Exception as e:
+            out.append(result('瀏覽器流程執行',False,str(e).split('Call log:')[0][:250]))
+        finally:
+            browser.close()
+    return out
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--html');ap.add_argument('--url',default='https://ssss31.netlify.app/');ap.add_argument('--browser',action='store_true');ap.add_argument('--headed',action='store_true');args=ap.parse_args()
-    out=[]
-    if args.html:out.extend(static(Path(args.html).read_text(encoding='utf-8')))
-    if args.browser:out.extend(browser(args.url,args.headed))
-    if not out:ap.error('請使用 --html 路徑 或 --browser')
-    result={'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'url':args.url,'results':out,'summary':{s:sum(x['status']==s for x in out) for s in ('PASS','FAIL','BLOCKED')}}
-    Path('s31_qa_report.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
-    for x in out:print(f"{x['status']:7} {x['test']} {x.get('detail','')}")
-    print('結果:',result['summary']);print('報告: s31_qa_report.json')
-    return 1 if any(x['status']=='FAIL' for x in out) else 0
+    parser=argparse.ArgumentParser();parser.add_argument('--browser',action='store_true');parser.add_argument('--url',default='https://ssss31.netlify.app/');args=parser.parse_args()
+    if not args.browser:parser.error('請使用 --browser')
+    out=run(args.url)
+    summary={s:sum(r['status']==s for r in out) for s in ['PASS','FAIL','BLOCKED']}
+    Path('s31_qa_report.json').write_text(json.dumps({'time':datetime.datetime.now(datetime.timezone.utc).isoformat(),'results':out,'summary':summary},ensure_ascii=False,indent=2),encoding='utf-8')
+    for r in out:print(r['status'],r['test'],r.get('detail',''))
+    print('結果:',summary)
+    return 1 if summary['FAIL'] or summary['BLOCKED'] else 0
 if __name__=='__main__':sys.exit(main())
