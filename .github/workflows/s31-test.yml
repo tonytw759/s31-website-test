@@ -1,14 +1,21 @@
-name: S31 網站自動化測試
+name: S31 整合自動化驗收
 
 on:
   workflow_dispatch:
+    inputs:
+      allow_order:
+        description: '允許建立一筆真實測試訂單（只在手動執行時使用）'
+        type: boolean
+        required: true
+        default: false
+
   push:
     branches: [main]
 
 jobs:
   browser-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: 下載測試程式
@@ -19,26 +26,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 安裝測試工具
+      - name: 安裝 Playwright 測試工具
         run: |
           python -m pip install --upgrade pip
           pip install playwright beautifulsoup4
           python -m playwright install --with-deps chromium
 
-      - name: 執行公開網站及登入驗證
+      - name: 執行 S31 全站整合驗收
         env:
           S31_TEST_USERNAME: ${{ secrets.S31_TEST_USERNAME }}
           S31_TEST_PASSWORD: ${{ secrets.S31_TEST_PASSWORD }}
-        run: |
-          python test_s31.py --browser --url https://ssss31.netlify.app/
+          ALLOW_ORDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_order == true }}
 
-      - name: 儲存測試結果與截圖
+        run: |
+          if [ "$ALLOW_ORDER" = "true" ]; then
+            python test_s31.py --browser --allow-order
+          else
+            python test_s31.py --browser
+          fi
+
+      - name: 儲存測試報告及截圖
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: S31-login-test-results
+          name: S31-qa-report
           path: |
             s31_qa_report.json
             s31_mobile.png
             s31_desktop.png
+            s31_test_order_id.txt
           if-no-files-found: warn
